@@ -268,76 +268,130 @@ void short_wait(void) // creates pause required in between clocked GPIO settings
 
 
 
+#define N_ROTARY    2
+#define ADDR        0
+#define DATA        1
+#define UNDEFINED   (-1)
+#define NORMAL      0
+#define REVERSED    1        // early production PiDP11s had reversed rotarty encoders
+#define SYNC        0b11
+#define CW          0
+#define CCW         1
+
+#ifndef true
+  #define true    (1)
+  #define false   (0)
+#endif
+
 void check_rotary_encoders(int switchscan)
 {
-	// 2 rotary encoders. Each has two switch pins. Normally, both are 0 - no rotation.
-	// encoder 1: row1, bits 8,9. Encoder 2: row1, bits 10,11
-	// Gray encoding: rotate up sequence   = 11 -> 01 -> 00 -> 10 -> 11
-	// Gray encoding: rotate down sequence = 11 -> 10 -> 00 -> 01 -> 11
+    // 2 rotary encoders. Each has two switch pins. Normally, both are 0 - no rotation.
+    // encoder 1: row1, bits 8,9. Encoder 2: row1, bits 10,11
+    // Gray encoding: rotate up sequence   = 11 -> 01 -> 00 -> 10 -> 11
+    // Gray encoding: rotate down sequence = 11 -> 10 -> 00 -> 01 -> 11
 
-	static int lastCode[2] = {3,3};
-	static int direction = -1;
-	static char* envdirection;
-	int code[2];
-	int i;
-	
-	if (direction == -1)
-	{
-		// First pass through, check environment
-		// Assume PIDP_11_ROTATION is not set
-		direction = 0;
-		envdirection = getenv("PIDP_11_ROTATION");
-		if (envdirection != NULL)
-		{
-			if (strcmp(envdirection, "FLIP") == 0)
-        	{
-				direction = 1;
-			}
-		}
-	}
-	code[0] = (switchscan & 0x300) >> 8;
-	code[1] = (switchscan & 0xC00) >> 10;
-	switchscan = switchscan & 0xff;	// set the 4 bits to zero
+	// When 0b11, 0b01 or 0b11, 0b10 is detected - mark the assumed rotary direction.
+	// This must correspond to the appropriate trailing sequence 0b10, 0b11 or 0b01, 0b11
+	// to be valid. 
+    static int startDirection[ N_ROTARY ] = {0,0};
+	// On in nvalid sequence, mark to resync (ignore until 0b11 is received)
+    static int bResync[ N_ROTARY ] = {true, true};
 
-//printf("code 0 = %d, code 1 = %d\n", code[0], code[1]);
+	// There are two variants of switch hardware. If the action of the control is backward,
+	// define the environment variable to reverse
+	//     export PIDP_11_ROTATION="FLIP"
+    static int direction = UNDEFINED;
+    static char* envdirection;
 
-	// detect rotation
-	for (i=0;i<2;i++)
-	{
-		if ((code[i]==1) && (lastCode[i]==3))
-			lastCode[i]=code[i];
-		else if ((code[i]==2) && (lastCode[i]==3))
-			lastCode[i]=code[i];
-	}
+	// extract the two bits for each rotary switch from a row containing other switches.
+    int currentCode[ N_ROTARY ];
+	// save the previous state (when it differs from the current one) so we can act
+	// on specific transitions
+    static int previousCode[2] = { SYNC, SYNC };
+	// which switch (address (8 positions) or data (4 positions))
+    int i;
 
-	// detect end of rotation
-	for (i=0;i<2;i++)
-	{
-		if ((code[i]==3) && (lastCode[i]==1))
-		{
-			lastCode[i]=code[i];
-			switchscan = switchscan + (1<<((i*2)+8));
-			if (direction == 1)
-    			knobValue[i]--;
-    		else
-    			knobValue[i]++;
-		}
-		else if ((code[i]==3) && (lastCode[i]==2))
-		{
-			lastCode[i]=code[i];
-			switchscan = switchscan + (2<<((i*2)+8));
-			if (direction == 1)
-    			knobValue[i]++;
-    		else
-    			knobValue[i]--;
+	// We only need to do this once upon start
+    if (direction == UNDEFINED)
+    {
+        // First pass through, check environment
+        // Assume PIDP_11_ROTATION is not set
+        direction = NORMAL;
+        envdirection = getenv("PIDP_11_ROTATION");
+        if (envdirection != NULL)
+        {
+            if (strcmp(envdirection, "FLIP") == 0)
+            {
+                direction = REVERSED;
+            }
+        }
+    }
 
-		}
-	}
+	// extract the two bits for the quadrature channels of each switch
+    currentCode[ ADDR ] = (switchscan & 0x300) >> 8;
+    currentCode[ DATA ] = (switchscan & 0xC00) >> 10;
 
-	knobValue[0] = knobValue[0] & 7;
-	knobValue[1] = knobValue[1] & 3;
+    switchscan = switchscan & 0xff;	// set the 4 bits to zero
 
-	// end result: bits 8,9 are 00 normally, 01 if UP, 10 if DOWN. Same for bits 10,11 (knob 2)
-	// these bits are not used, actually. Status is communicated through global variable knobValue[i]
+	// act for each switch
+    for ( i=0; i < N_ROTARY; i++)
+    {
+        if( bResync[i] ) {
+            // looking for sync sequence (0b11)
+            if( currentCode[i] == SYNC )
+                bResync[i] = false;
+
+            previousCode[i] = currentCode[i];   // this will abandon any further processing
+        }
+
+		// only act on transitions
+        if( currentCode[i] == previousCode[i] ) // nothing to see here
+            continue;
+
+        // detect initial rotation direction
+        // look for 0b11, 0b01 or 0b11, 0b11 which are the first two bytes of a sequence
+        if( previousCode[ i ] == SYNC ) {
+            if ( currentCode[ i ] == 0b01 ) {
+                startDirection[ i ] = CW;			// 0b11, 0b01 clockwise
+            } else if ( currentCode[i] == 0b10 ) {
+                startDirection[ i ] = CCW;			// 0b11, 0b11 counter clockwise
+            } else { 
+                bResync[i] = true;     				// should never see 0b11 followed by 0b00
+            }
+        }
+
+        // detect final rotation direction
+        // look for 0b10, 0b11 or 0b01, 0b11 which are the last two bytes of a sequence
+        if( currentCode[i] == SYNC && !bResync[i]) {
+            if ( previousCode[ i ] == 0b01 ) {
+                if( startDirection[ i ] == CCW ) {
+                    // 0b11, 0b10, 0b00, 0b01, 0x11 recognised (CCW)
+                    knobValue[i] += ( direction == REVERSED ? +1 : -1 );
+                } else {
+                    // this is an error .. 
+                    // 0b11, 0b10, 0b00, 0b10, 0x11 recognised (bogus/partial switch)
+                }
+            } else if ( previousCode[i] == 0b10 ) {
+                if( startDirection[ i ] == CW ) {
+                    // 0b11, 0b01, 0b00, 0b10, 0x11 recognised (CCW)
+                    knobValue[i] += ( direction == REVERSED ? -1 : +1 );
+                } else {
+                    // this is an error .. 
+                    // 0b11, 0b01, 0b00, 0b01, 0x11 recognised (bogus/partial switch)
+                }
+            } 
+        }
+
+        if( currentCode[i] != previousCode[i] ) {
+            // printf( "%s %02b --> %02b\r\n", i==0 ? "address" : "data", previousCode[i], currentCode[i]);
+            previousCode[i] = currentCode[i];
+        }
+
+    }
+
+    knobValue[ ADDR ] = knobValue[ ADDR ] & 0b00000111;   // 8 selections for address rotary switch
+    knobValue[ DATA ] = knobValue[ DATA ] & 0b00000011;   // 4 selections for data rotary switch
+
+    // Status is communicated through global variable knobValue[i]
 
 }
