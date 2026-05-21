@@ -20,14 +20,15 @@
  IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
- 01-Sep-2025  TK    Change list is now at https://github.com/Terri-Kennedy/pidp11/commits/main/
- 06-Jul-2025  TK    Merge mutex additions from Eric N, add comments about knob rotation direction
- 18-Dec-2023  OV    new GPIO interface using the code of pinctrl, needed for Pi 5
- 14-Aug-2019  OV    fix for Raspberry Pi 4's different pullup configuration
- 01-Jul-2017  MH    remove INP_GPIO before OUT_GPIO and change knobValue
- 01-Apr-2016  OV    almost perfect before VCF SE
- 15-Mar-2016  JH    display patterns for brightness levels
- 16-Nov-2015  JH    acquired from Oscar
+ 21-May-2026  BQT/MK Change rotary decoding to properly work with gray code sequence.
+ 01-Sep-2025  TK     Change list is now at https://github.com/Terri-Kennedy/pidp11/commits/main/
+ 06-Jul-2025  TK     Merge mutex additions from Eric N, add comments about knob rotation direction
+ 18-Dec-2023  OV     new GPIO interface using the code of pinctrl, needed for Pi 5
+ 14-Aug-2019  OV     fix for Raspberry Pi 4's different pullup configuration
+ 01-Jul-2017  MH     remove INP_GPIO before OUT_GPIO and change knobValue
+ 01-Apr-2016  OV     almost perfect before VCF SE
+ 15-Mar-2016  JH     display patterns for brightness levels
+ 16-Nov-2015  JH     acquired from Oscar
 
 
  gpio.c from Oscar Vermeules PiDP8-sources.
@@ -228,8 +229,8 @@ void *blink(int *terminate)
 				gpio_set_dir(rows[i], DIR_OUTPUT);
 				gpio_set_drive(rows[i], DRIVE_LOW);
 
-				nanosleep((struct timespec[]) { { 0, intervl / 100}}, NULL); 
-				// probably unnecessary long wait
+				nanosleep((struct timespec[]) { { 0, intervl / 200}}, NULL); 
+				// probably unnecessary long wait (MK: changed from 100 to 200 to increase sample frequency) 
 
 				switchscan = 0;
 				for (j = 0; j < 12; j++) // 12 switches in each row
@@ -269,14 +270,16 @@ void short_wait(void) // creates pause required in between clocked GPIO settings
 
 
 #define N_ROTARY    2
+#define N_STATES    4
 #define ADDR        0
 #define DATA        1
-#define UNDEFINED   (-1)
-#define NORMAL      0
-#define REVERSED    1        // early production PiDP11s had reversed rotarty encoders
-#define SYNC        0b11
-#define CW          0
-#define CCW         1
+#define UNDEFINED   (0)
+#define NORMAL      (1)
+#define REVERSED    (-1)        // early production PiDP11s had reversed rotarty encoders
+
+#define KNOB_SCALE 4            // scale to match transitions ber detent of the switch
+#define ADDR_MASK  0b00011111   // the range of values for the address knob (times 4)
+#define DATA_MASK  0b00001111   // the range of values for the data knob (times 4)
 
 #ifndef true
   #define true    (1)
@@ -285,37 +288,45 @@ void short_wait(void) // creates pause required in between clocked GPIO settings
 
 void check_rotary_encoders(int switchscan)
 {
-    // 2 rotary encoders. Each has two switch pins. Normally, both are 0 - no rotation.
-    // encoder 1: row1, bits 8,9. Encoder 2: row1, bits 10,11
+    // 2 rotary encoders. Each has two switch pins.
+    // Encoder 1: row1, bits 8,9. Encoder 2: row1, bits 10,11
     // Gray encoding: rotate up sequence   = 11 -> 01 -> 00 -> 10 -> 11
     // Gray encoding: rotate down sequence = 11 -> 10 -> 00 -> 01 -> 11
 
-	// When 0b11, 0b01 or 0b11, 0b10 is detected - mark the assumed rotary direction.
-	// This must correspond to the appropriate trailing sequence 0b10, 0b11 or 0b01, 0b11
-	// to be valid. 
-    static int startDirection[ N_ROTARY ] = {0,0};
-	// On in nvalid sequence, mark to resync (ignore until 0b11 is received)
-    static int bResync[ N_ROTARY ] = {true, true};
+    // Array that describes the shift for each previous rotary code to the new rotary code.
+    //
+    // The first index is the previous istate, and the second is the current state.
+    // example: 00 -> 01 is a CCW movement.
+    //
+    const enum { CW, CCW, NOP } grayShift[ N_STATES ][ N_STATES ] 
+        = {{ NOP, CCW, CW,  NOP},
+           { CW,  NOP, NOP, CCW},
+           { CCW, NOP, NOP, CW },
+           { NOP, CW,  CCW, NOP}};
 
-	// There are two variants of switch hardware. If the action of the control is backward,
-	// define the environment variable to reverse
-	//     export PIDP_11_ROTATION="FLIP"
+
     static int direction = UNDEFINED;
-    static char* envdirection;
 
-	// extract the two bits for each rotary switch from a row containing other switches.
     int currentCode[ N_ROTARY ];
-	// save the previous state (when it differs from the current one) so we can act
-	// on specific transitions
-    static int previousCode[2] = { SYNC, SYNC };
-	// which switch (address (8 positions) or data (4 positions))
+    static int previousCode[ N_ROTARY ] = { 0b11, 0b11 };   // detent state of the knobs
+    static int knobState[ N_ROTARY ] = { 0, 0 };            // starting values for both knobs are set on first pass below 
+    static int knobLimit[ N_ROTARY ] = {ADDR_MASK, DATA_MASK};
+    static int nIdle[ N_ROTARY ] = {0,0};
     int i;
 
-	// We only need to do this once upon start
+    currentCode[ ADDR ] = (switchscan >> 8) & 3;
+    currentCode[ DATA ] = (switchscan >> 10) & 3;
+
+    // On the first pass through this code, we'll figure out what the direction should be,
+    // and we'll also setup the other static variables with good initial states.
+    //
     if (direction == UNDEFINED)
     {
         // First pass through, check environment
-        // Assume PIDP_11_ROTATION is not set
+        // Assume "normal" rotation direction, but if the environment variable
+        // "PIDP_11_ROTATION" is set to "FLIP" we'll reverse the rotation decoding.
+
+        char* envdirection;
         direction = NORMAL;
         envdirection = getenv("PIDP_11_ROTATION");
         if (envdirection != NULL)
@@ -325,73 +336,34 @@ void check_rotary_encoders(int switchscan)
                 direction = REVERSED;
             }
         }
+
+        memcpy(knobState, (int[]){ knobValue[ADDR] * 4 , knobValue[DATA] * 4 }, sizeof(knobState));
+        memcpy(previousCode, currentCode, sizeof(currentCode)); /* On initial setup, we'll take the previousCode same as currentCode */
     }
 
-	// extract the two bits for the quadrature channels of each switch
-    currentCode[ ADDR ] = (switchscan & 0x300) >> 8;
-    currentCode[ DATA ] = (switchscan & 0xC00) >> 10;
-
-    switchscan = switchscan & 0xff;	// set the 4 bits to zero
-
-	// act for each switch
+    // Determine an action based on the previous and current states
+    // Some transitions indicate CW, CCWi movement.
+    //
     for ( i=0; i < N_ROTARY; i++)
     {
-        if( bResync[i] ) {
-            // looking for sync sequence (0b11)
-            if( currentCode[i] == SYNC )
-                bResync[i] = false;
-
-            previousCode[i] = currentCode[i];   // this will abandon any further processing
+        int code = grayShift[previousCode[i]][currentCode[i]];
+        switch (code) {
+        case CW:
+            knobState[i] += direction;
+            break;
+        case CCW:
+            knobState[i] -= direction;
+            break;
+        case NOP:
+        default:
+            break;
         }
 
-		// only act on transitions
-        if( currentCode[i] == previousCode[i] ) // nothing to see here
-            continue;
+        knobState[i] = knobState[i] & knobLimit[i];     // limit the count (Address 8 states, Data 4 states)	
+        knobValue[i] = knobState[i] / KNOB_SCALE;       // Update the knob values after scaling
 
-        // detect initial rotation direction
-        // look for 0b11, 0b01 or 0b11, 0b11 which are the first two bytes of a sequence
-        if( previousCode[ i ] == SYNC ) {
-            if ( currentCode[ i ] == 0b01 ) {
-                startDirection[ i ] = CW;			// 0b11, 0b01 clockwise
-            } else if ( currentCode[i] == 0b10 ) {
-                startDirection[ i ] = CCW;			// 0b11, 0b11 counter clockwise
-            } else { 
-                bResync[i] = true;     				// should never see 0b11 followed by 0b00
-            }
-        }
-
-        // detect final rotation direction
-        // look for 0b10, 0b11 or 0b01, 0b11 which are the last two bytes of a sequence
-        if( currentCode[i] == SYNC && !bResync[i]) {
-            if ( previousCode[ i ] == 0b01 ) {
-                if( startDirection[ i ] == CCW ) {
-                    // 0b11, 0b10, 0b00, 0b01, 0x11 recognised (CCW)
-                    knobValue[i] += ( direction == REVERSED ? +1 : -1 );
-                } else {
-                    // this is an error .. 
-                    // 0b11, 0b10, 0b00, 0b10, 0x11 recognised (bogus/partial switch)
-                }
-            } else if ( previousCode[i] == 0b10 ) {
-                if( startDirection[ i ] == CW ) {
-                    // 0b11, 0b01, 0b00, 0b10, 0x11 recognised (CCW)
-                    knobValue[i] += ( direction == REVERSED ? -1 : +1 );
-                } else {
-                    // this is an error .. 
-                    // 0b11, 0b01, 0b00, 0b01, 0x11 recognised (bogus/partial switch)
-                }
-            } 
-        }
-
-        if( currentCode[i] != previousCode[i] ) {
-            // printf( "%s %02b --> %02b\r\n", i==0 ? "address" : "data", previousCode[i], currentCode[i]);
-            previousCode[i] = currentCode[i];
-        }
+        previousCode[i] = currentCode[i];
 
     }
-
-    knobValue[ ADDR ] = knobValue[ ADDR ] & 0b00000111;   // 8 selections for address rotary switch
-    knobValue[ DATA ] = knobValue[ DATA ] & 0b00000011;   // 4 selections for data rotary switch
-
-    // Status is communicated through global variable knobValue[i]
-
 }
+
