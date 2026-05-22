@@ -295,14 +295,14 @@ void check_rotary_encoders(int switchscan)
 
     // Array that describes the shift for each previous rotary code to the new rotary code.
     //
-    // The first index is the previous istate, and the second is the current state.
-    // example: 00 -> 01 is a CCW movement.
+    // Basically, the first index is the old position, and the second index is the new position.
+    //  So for example: 00 -> 01 is a CCW movement.
     //
-    const enum { CW, CCW, NOP } grayShift[ N_STATES ][ N_STATES ] 
+    const enum { CW, CCW, NOP, DTN } grayShift[ N_STATES ][ N_STATES ] 
         = {{ NOP, CCW, CW,  NOP},
            { CW,  NOP, NOP, CCW},
            { CCW, NOP, NOP, CW },
-           { NOP, CW,  CCW, NOP}};
+           { NOP, CW,  CCW, DTN}};
 
 
     static int direction = UNDEFINED;
@@ -337,12 +337,16 @@ void check_rotary_encoders(int switchscan)
             }
         }
 
-        memcpy(knobState, (int[]){ knobValue[ADDR] * 4 , knobValue[DATA] * 4 }, sizeof(knobState));
+        memcpy(knobState, (int[]){ (knobValue[ADDR] * N_STATES) + (N_STATES / 2), 
+                (knobValue[DATA] * N_STATES) + (N_STATES / 2)}, sizeof(knobState));
         memcpy(previousCode, currentCode, sizeof(currentCode)); /* On initial setup, we'll take the previousCode same as currentCode */
     }
 
-    // Determine an action based on the previous and current states
-    // Some transitions indicate CW, CCWi movement.
+    // Now to the meat of the function. Figure out what the current state (position) is for each knob.
+    // That's pretty simple. We take the old value, combined with the new value, and that gives us any
+    // state change, which we then translate into an update of the knobState.
+    //
+    // And then we pass that out as knobValue, scaled down as desired.
     //
     for ( i=0; i < N_ROTARY; i++)
     {
@@ -354,13 +358,18 @@ void check_rotary_encoders(int switchscan)
         case CCW:
             knobState[i] -= direction;
             break;
+        case DTN:
+            // If we get two SYNC states (0b11), assume a detent and
+            // reset micro state
+            knobState[i] -= (knobState[i] % N_STATES) - (N_STATES / 2);
+            break;
         case NOP:
         default:
             break;
         }
 
-        knobState[i] = knobState[i] & knobLimit[i];     // limit the count (Address 8 states, Data 4 states)	
-        knobValue[i] = knobState[i] / KNOB_SCALE;       // Update the knob values after scaling
+        knobState[i] = knobState[i] & knobLimit[i];
+        knobValue[i] = knobState[i] / KNOB_SCALE;
 
         previousCode[i] = currentCode[i];
 
